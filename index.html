@@ -99,7 +99,7 @@ const TRANSLATIONS = {
     clockInBtn: 'Regresar de descanso',
     outRecorded: 'Salida a descanso registrada.',
     inRecorded: 'Regreso registrado.',
-    tooFar: (dist, max) => `Estás a ${dist} m del área de trabajo (máximo permitido: ${max} m). No se puede ponchar.`,
+    tooFar: (dist, max, acc) => `Estás a ${dist} m del área de trabajo (máximo permitido: ${max} m; precisión del GPS: ±${acc} m). No se puede ponchar.`,
     todayLog: 'Registro de hoy',
     noPunchesYet: 'Nadie ha ponchado todavía.',
     out: 'Salió',
@@ -165,6 +165,7 @@ const TRANSLATIONS = {
     breakDurationLabel: 'Duración del descanso (minutos)',
     graceDurationLabel: 'Minutos extra de gracia',
     currentBreakDuration: (b, g) => `Actual: ${b} min + ${g} min de gracia = tarde después de ${b + g} min`,
+    locatingMsg: 'Buscando ubicación…',
   },
   en: {
     appTitle: 'Break Tracker',
@@ -181,7 +182,7 @@ const TRANSLATIONS = {
     clockInBtn: 'Clock back in',
     outRecorded: 'Break start recorded.',
     inRecorded: 'Return recorded.',
-    tooFar: (dist, max) => `You're ${dist} m from the work area (maximum allowed: ${max} m). Can't clock in/out.`,
+    tooFar: (dist, max, acc) => `You're ${dist} m from the work area (maximum allowed: ${max} m; GPS accuracy: ±${acc} m). Can't clock in/out.`,
     todayLog: "Today's log",
     noPunchesYet: 'No one has clocked in yet.',
     out: 'Out',
@@ -247,6 +248,7 @@ const TRANSLATIONS = {
     breakDurationLabel: 'Break duration (minutes)',
     graceDurationLabel: 'Extra grace minutes',
     currentBreakDuration: (b, g) => `Current: ${b} min + ${g} min grace = late after ${b + g} min`,
+    locatingMsg: 'Locating…',
   },
 };
 function t(key) { return TRANSLATIONS[state.lang][key]; }
@@ -301,7 +303,27 @@ function haversine(lat1, lon1, lat2, lon2) {
 function getPosition() {
   return new Promise((resolve, reject) => {
     if (!navigator.geolocation) { reject(new Error('no geo')); return; }
-    navigator.geolocation.getCurrentPosition(resolve, reject, { enableHighAccuracy: true, timeout: 12000, maximumAge: 0 });
+    const GOOD_ENOUGH = 20;   // meters — stop early once we get a fix this precise
+    const MAX_WAIT = 18000;   // ms — give the GPS chip time to lock on indoors
+    let best = null;
+    let done = false;
+    let watchId;
+    const finish = (pos, err) => {
+      if (done) return;
+      done = true;
+      if (watchId != null) navigator.geolocation.clearWatch(watchId);
+      if (pos) resolve(pos);
+      else if (err) reject(err);
+    };
+    const timer = setTimeout(() => finish(best, best ? null : { code: 3 }), MAX_WAIT);
+    watchId = navigator.geolocation.watchPosition(
+      pos => {
+        if (!best || pos.coords.accuracy < best.coords.accuracy) best = pos;
+        if (pos.coords.accuracy <= GOOD_ENOUGH) { clearTimeout(timer); finish(pos); }
+      },
+      err => { clearTimeout(timer); finish(best, best ? null : err); },
+      { enableHighAccuracy: true, maximumAge: 0, timeout: MAX_WAIT }
+    );
   });
 }
 function locErrorText(e) {
@@ -501,8 +523,13 @@ async function handlePunch() {
   try {
     const pos = await getPosition();
     const dist = haversine(pos.coords.latitude, pos.coords.longitude, state.config.workLat, state.config.workLng);
-    if (dist > state.config.radiusMeters) {
-      state.geoMsg = { type: 'error', text: t('tooFar')(Math.round(dist), state.config.radiusMeters) };
+    const accuracy = Math.round(pos.coords.accuracy || 0);
+    // Give the benefit of the doubt for GPS margin of error: if the true
+    // position could plausibly be within the radius given the reported
+    // accuracy, allow it instead of blocking on an imprecise reading.
+    const effectiveDist = Math.max(0, dist - accuracy);
+    if (effectiveDist > state.config.radiusMeters) {
+      state.geoMsg = { type: 'error', text: t('tooFar')(Math.round(dist), state.config.radiusMeters, accuracy) };
       state.punching = false; render(); return;
     }
     const last = myLastPunch();
@@ -742,7 +769,7 @@ function mainView() {
         <button id="punchBtn" class="stamp-btn" style="${onBreak ? 'background:#F5A623;border-color:#F5A623;box-shadow:0 0 40px rgba(245,166,35,0.25);' : ''}" ${state.punching ? 'disabled' : ''}>
           <span style="color:${onBreak ? '#12161B' : '#F5A623'}">${state.punching ? `<span class="spin">${ICONS.clock}</span>` : (onBreak ? ICONS.in : ICONS.out)}</span>
           <span class="display" style="font-weight:600;font-size:15px;text-align:center;padding:0 16px;color:${onBreak ? '#12161B' : '#E8EAED'};">
-            ${onBreak ? t('clockInBtn') : t('clockOutBtn')}
+            ${state.punching ? t('locatingMsg') : (onBreak ? t('clockInBtn') : t('clockOutBtn'))}
           </span>
         </button>
       </div>
